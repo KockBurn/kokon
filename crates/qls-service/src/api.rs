@@ -263,7 +263,7 @@ async fn status(State(s): St) -> Json<Value> {
         },
         "upscaler": { "model": cfg.upscaler().map(|u| u.0).unwrap_or_else(|| cfg.upscaler_model.clone()), "available": cfg.upscaler_file().is_some() },
         "engine": { "release": catalog::engine_tag(), "update_needed": engine_update },
-        "profile": { "id": cfg.profile().id, "display_name": cfg.profile().display_name, "source": cfg.profile().source },
+        "profile": { "id": cfg.profile().id, "display_name": cfg.profile().display_name, "source": cfg.profile().source, "sampling_mode": cfg.profile().recommended_settings.sampling_mode },
         "gpu": gpu,
         "active_job": s.engine.active_job(),
         "queue": { "queued": queued, "jobs": jobs.iter().filter(|j| !j.status.is_terminal()).collect::<Vec<_>>() },

@@ -187,16 +187,15 @@ export function needsPrompt(c: Composer): boolean {
 
 /** Advanced fields that change how the model samples. They last for the session only: a value
  * typed once must not silently override the presets after a restart. */
-const SAMPLING_OVERRIDES = ["sampler", "strength", "reference_detail"];
-/** Fields of older versions that Turbo's fixed schedule no longer uses (may sit in saved
- * preferences, projects and gallery records): dropped everywhere. */
-const REMOVED_ADVANCED = ["steps", "cfg", "scheduler", "flow_shift", "refine"];
+const SAMPLING_OVERRIDES = ["sampler", "steps", "cfg", "strength", "reference_detail"];
+/** Legacy fields no longer supported. Steps and CFG are now valid for Base mode. */
+const REMOVED_ADVANCED = ["scheduler", "flow_shift", "refine"];
 
 /** Labels of the sampling overrides currently set, e.g. ["Sampler heun", "Strength 0.8"]. */
-export function activeOverrides(a: Advanced): string[] {
-  const label: Record<string, string> = { sampler: "Sampler", strength: "Strength", reference_detail: "Reference" };
+export function activeOverrides(a: Advanced, baseSampling = true): string[] {
+  const label: Record<string, string> = { sampler: "Sampler", steps: "Steps", cfg: "CFG", strength: "Strength", reference_detail: "Reference" };
   return Object.entries(cleanAdvanced(a))
-    .filter(([k]) => SAMPLING_OVERRIDES.includes(k))
+    .filter(([k]) => SAMPLING_OVERRIDES.includes(k) && (baseSampling || (k !== "steps" && k !== "cfg")))
     .map(([k, v]) => `${label[k]} ${v}`);
 }
 

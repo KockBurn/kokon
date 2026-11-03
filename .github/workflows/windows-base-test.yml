@@ -1,0 +1,64 @@
+name: Windows Base Steps-CFG test installer
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-base-test.yml"
+      - "src-tauri/tauri.base-test.conf.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-base-test:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            mcp/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Install UI and MCP dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Push-Location mcp
+          try {
+            npm ci
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Pop-Location
+          }
+      - name: Build embedded browser UI
+        run: npm run build
+      - name: Build patched Kokon service
+        run: cargo build -p qls-service --release --locked
+      - name: Install patched service sidecar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          Copy-Item target/release/kokon-service.exe src-tauri/binaries/kokon-service-x86_64-pc-windows-msvc.exe -Force
+      - name: Build MCP sidecar
+        working-directory: mcp
+        run: npm run build:exe
+      - name: Build unsigned Windows NSIS test installer
+        run: npx tauri build --bundles nsis --no-sign --config src-tauri/tauri.base-test.conf.json
+      - name: Upload Kokon Base test installer and instructions
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kokon-Base-Steps-CFG-Windows-${{ github.run_number }}
+          path: |
+            target/release/bundle/nsis/*-setup.exe
+            docs/base-sampling-test.md
+          if-no-files-found: error
+          retention-days: 7

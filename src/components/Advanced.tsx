@@ -5,7 +5,7 @@ import { Seg, Switch } from "./ui";
 import { UpscalerSettings } from "./Upscalers";
 
 // Verified against sd-server 3f8527a capabilities; replaced by the live list when loaded.
-// Steps, CFG and scheduler are fixed by the Turbo model's 8-step schedule (no CFG).
+// Turbo uses a fixed schedule. Base explicitly opts into adjustable Steps and CFG.
 const FALLBACK_SAMPLERS = ["euler", "euler_a", "heun", "dpm2", "dpm++2s_a", "dpm++2m", "dpm++2mv2", "ipndm", "ipndm_v", "lcm", "ddim_trailing", "tcd", "res_multistep", "res_2s", "er_sde"];
 
 function NumField(props: { label: string; value: number | null | undefined; placeholder: string; min: number; max: number; step?: number; onChange: (v: number | null) => void }) {
@@ -34,6 +34,7 @@ export function AdvancedPanel({ plan }: { plan: Plan | null }) {
   const c = useStore((s) => s.composer);
   const samplers = useStore((s) => (s.status?.server as { samplers?: string[] } | undefined)?.samplers);
   const a = c.advanced;
+  const baseSampling = useStore((s) => s.status?.profile?.sampling_mode === "base");
   const setA = (patch: Partial<Advanced>) => updateComposer({ advanced: { ...a, ...patch } });
   const editLike = plan && (plan.mode === "inpaint" || plan.mode === "outpaint" || plan.mode === "edit");
 
@@ -56,6 +57,13 @@ export function AdvancedPanel({ plan }: { plan: Plan | null }) {
         </div>
       </label>
 
+      {baseSampling && (
+        <>
+          <NumField label="Steps" value={a.steps ?? null} placeholder={String(plan?.steps ?? 40)} min={1} max={150} onChange={(v) => setA({ steps: v })} />
+          <NumField label="CFG" value={a.cfg ?? null} placeholder={String(plan?.cfg ?? 2)} min={0.1} max={20} step={0.1} onChange={(v) => setA({ cfg: v })} />
+          <span className="muted">Qwen 2.1 Base uses the normal sampling schedule. Defaults: 40 steps, CFG 2.</span>
+        </>
+      )}
       <label className="field-row">
         <span>Sampler</span>
         <select className="select" value={a.sampler ?? ""} onChange={(e) => setA({ sampler: e.target.value || null })}>

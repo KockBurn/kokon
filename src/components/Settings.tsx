@@ -617,6 +617,18 @@ export function Settings() {
                   <PathField label="VAE" value={profile.vae} onChange={(v) => setProfile({ vae: v })} />
                   <PathField label="Text encoder (Qwen3-VL)" value={profile.textEncoder} onChange={(v) => setProfile({ textEncoder: v })} />
                   <PathField label="Vision projector (mmproj)" value={profile.visionProjector ?? ""} onChange={(v) => setProfile({ visionProjector: v || null })} />
+                  <label className="field-row">
+                    <span>Sampling profile (your Qwen 2.1 files)</span>
+                    <select
+                      className="select"
+                      value={profile.recommendedSettings.sampling_mode === "base" ? "base" : "turbo"}
+                      onChange={(e) => setProfile({ recommendedSettings: { ...profile.recommendedSettings, sampling_mode: e.target.value } })}
+                    >
+                      <option value="turbo">Turbo: fixed 8 steps, CFG 1</option>
+                      <option value="base">Base: adjustable Steps and CFG</option>
+                    </select>
+                  </label>
+                  <span className="muted">Select Base for full Qwen-Image 2.1 weights. This changes sampling only; it does not replace your model files.</span>
                 </>
               )}
               {ms?.dit.update && (

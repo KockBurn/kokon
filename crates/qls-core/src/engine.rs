@@ -1185,6 +1185,16 @@ impl Engine {
             let mut lines = self.server.subscribe_lines();
             let detailed = self.server.status().owned;
             let submitted = Instant::now();
+            // Record the actual native request values, not just what the UI displayed.
+            // No prompts, image data, LoRA paths, or other user content is logged.
+            tracing::info!(
+                "SAMPLING_SUBMIT job={} mode={:?} sample_steps={} txt_cfg={} custom_sigmas={}",
+                id,
+                profile.recommended_settings.sampling_mode,
+                sd_req.sample_params.sample_steps,
+                sd_req.sample_params.guidance.txt_cfg,
+                sd_req.sample_params.custom_sigmas.len()
+            );
             let accepted = client.submit(&sd_req).await?;
             drop(sd_req); // release the base64 payloads
             self.update(id, |j| {
