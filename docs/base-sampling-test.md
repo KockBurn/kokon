@@ -17,3 +17,7 @@ This branch changes only the KockBurn/kokon test fork. It does not modify Workbe
 - Base uses the backend's normal sampling schedule; Kokon's built-in Turbo sigmas are omitted.
 - Rust tests assert that Base 40/CFG 2 is serialized into the actual `/sdcpp/v1/img_gen` payload and that Turbo is unchanged.
 - Before a production install, test this fork on actual Base weights. Kokon's CUDA engine is reused, not modified.
+
+## Automated checks
+
+The fork's pull-request workflow runs UI typechecking/Vitest and Rust core tests. These verify serialized sampling requests and Turbo regression; they **do not** verify RTX 3090 image quality or backend-side application of CFG. Check the workflow result before installing the branch. The installed production Kokon and other repositories stay unchanged.
