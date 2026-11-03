@@ -850,7 +850,7 @@ pub(crate) mod tests {
         let table = [(size, fp.as_str())];
         let b = inspect_with(&base, &table).unwrap();
         assert_eq!((b.compatible, b.problem.as_deref()), (true, None), "a warning, not a block");
-        assert!(b.warning.unwrap().contains("not Turbo"));
+        assert!(b.warning.unwrap().contains("Sampling profile to Base"));
         // Renamed, it is still the base model.
         let renamed = dir.path().join("my-turbo.gguf");
         std::fs::copy(&base, &renamed).unwrap();
