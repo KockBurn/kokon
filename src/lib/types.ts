@@ -25,6 +25,8 @@ export interface OutpaintSpec { left: number; right: number; top: number; bottom
 
 export interface Advanced {
   sampler?: string | null;
+  steps?: number | null;
+  cfg?: number | null;
   strength?: number | null;
   batch_count?: number | null;
   output_format?: OutputFormat | null;
@@ -233,7 +235,7 @@ export interface StatusResponse {
     /** The engine can run an upscaler model (null: not running). */
     upscale?: boolean | null;
   };
-  profile: { id: string; display_name: string; source: ProfileSource };
+  profile: { id: string; display_name: string; source: ProfileSource; sampling_mode?: "turbo" | "base" };
   gpu: { name: string; vendor: string; unified: boolean; memory_total_mib: number; memory_used_mib: number; memory_free_mib: number; driver_version: string } | null;
   active_job: JobView | null;
   queue: { queued: number; jobs: JobView[] };

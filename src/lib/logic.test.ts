@@ -28,8 +28,9 @@ describe("advanced overrides", () => {
   const saved = { batch_count: null, cfg: 4, flow_shift: null, hdr: false, output_format: "png" as const, refine: null, sampler: null, scheduler: null, steps: 20, strength: 1, vae_tiling: null };
 
   it("lists only the sampling overrides that are set", () => {
-    // Steps, CFG and scheduler are fixed by Turbo: old values are dropped, never shown.
-    expect(activeOverrides(saved)).toEqual(["Strength 1"]);
+    // Base keeps the sampling overrides; Turbo hides the Base-only controls.
+    expect(activeOverrides(saved)).toEqual(["CFG 4", "Steps 20", "Strength 1"]);
+    expect(activeOverrides(saved, false)).toEqual(["Strength 1"]);
     expect(activeOverrides({ sampler: "heun" })).toEqual(["Sampler heun"]);
     expect(activeOverrides({ output_format: "webp", hdr: true, batch_count: 2 })).toEqual([]);
     expect(activeOverrides({})).toEqual([]);
@@ -37,6 +38,13 @@ describe("advanced overrides", () => {
     expect(persistentAdvanced({ reference_detail: "full", output_format: "webp" })).toEqual({ output_format: "webp" });
     // Every new chat starts at the standard 1 MP reference, other settings carry over.
     expect(emptyComposer({ advanced: { reference_detail: "full", batch_count: 2 } }).advanced).toEqual({ batch_count: 2 });
+  });
+
+  it("sends Base steps and CFG but never saves them as global preferences", () => {
+    const c = { ...emptyComposer(), prompt: "a fox", advanced: { steps: 40, cfg: 2, sampler: "euler" } };
+    const request = buildRequest(c);
+    expect(request.advanced.steps).toBe(40);
+    expect(request.advanced.cfg).toBe(2);
   });
 
   it("keeps preferences but never persists sampling overrides", () => {

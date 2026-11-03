@@ -494,7 +494,8 @@ export function Composer() {
   const { plan, error } = usePlanPreview();
   const taRef = useRef<HTMLTextAreaElement>(null);
   const hasImages = c.refs.length > 0;
-  const overrides = activeOverrides(c.advanced);
+  const baseSampling = useStore((s) => s.status?.profile?.sampling_mode === "base");
+  const overrides = activeOverrides(c.advanced, baseSampling);
   const canEnhance = useStore(enhancerAvailable) && enhancerApplies(c);
   const newImage = !editing(c);
   // Prompt+ review: the prompt it is writing streams into the box, which is read-only meanwhile.

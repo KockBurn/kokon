@@ -138,12 +138,23 @@ pub enum RefineMode {
     Best,
 }
 
-/// Per-model planning settings. Sampling itself is fixed by the Turbo model: its 8-step
-/// schedule (`planner::TURBO_SIGMAS`) at CFG 1.
+/// Explicit sampling profile for user-supplied Qwen Image 2.1 weights.
+/// Never infer this from filenames: Base and Turbo share tensor structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingMode {
+    #[default]
+    Turbo,
+    Base,
+}
+
+/// Per-model planning settings. Official Kokon weights always use Turbo's
+/// exact eight-step schedule; custom files may opt into Base sampling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecommendedSettings {
     pub sampler: String,
+    pub sampling_mode: SamplingMode,
     /// Pixel area used by Auto resolution at each quality level.
     pub area_fast: u64,
     pub area_balanced: u64,
@@ -158,7 +169,7 @@ impl Default for RecommendedSettings {
         // Official Qwen-Image 2.1 Turbo settings (Qwen/Qwen-Image-2.1-Turbo model card): its
         // saved 8-step schedule with flow-matching Euler, no CFG, native 2K buckets. The
         // presets differ only in size: ~1 MP, 1.5K and native 2K.
-        Self { sampler: "euler".into(), area_fast: 1024 * 1024, area_balanced: 1536 * 1536, area_quality: 2048 * 2048, align: 32, max_side: 4096, max_references: 10 }
+        Self { sampler: "euler".into(), sampling_mode: SamplingMode::Turbo, area_fast: 1024 * 1024, area_balanced: 1536 * 1536, area_quality: 2048 * 2048, align: 32, max_side: 4096, max_references: 10 }
     }
 }
 

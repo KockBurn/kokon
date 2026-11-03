@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::config::RecommendedSettings;
+use crate::config::{RecommendedSettings, SamplingMode};
 use crate::error::{AppError, ErrorCode};
 use crate::geometry::{
     self, CanvasLimits, Expansion, ExpansionUnits, OutpaintPlan, Rect, Size, WorkingCanvas, aspect_label, dims_for_area,
@@ -197,6 +197,10 @@ pub struct OutpaintSpec {
 #[serde(default)]
 pub struct AdvancedOptions {
     pub sampler: Option<String>,
+    /// Base-model steps (Turbo intentionally ignores this setting).
+    pub steps: Option<u32>,
+    /// Base-model text CFG (Turbo intentionally ignores this setting).
+    pub cfg: Option<f32>,
     /// Edit/inpaint denoising strength (0..1).
     pub strength: Option<f32>,
     pub batch_count: Option<u32>,
@@ -323,9 +327,9 @@ pub struct Plan {
     pub working: Size,
     /// Content area inside `working` that maps to the output (rest is alignment padding).
     pub content: Rect,
-    /// Sampling steps (Turbo's 8; 0 = no diffusion, a Quick upscale).
+    /// Sampling steps (Turbo uses 8, Base defaults to 40; 0 for Quick upscale).
     pub steps: u32,
-    /// Always 1 (Turbo runs without classifier-free guidance).
+    /// Effective text CFG (Turbo uses 1, Base defaults to 2).
     pub cfg: f32,
     pub sampler: String,
     pub strength: Option<f32>,
@@ -915,13 +919,21 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
     }
     let mut notes = Vec::new();
     let quality = req.quality;
-    // Turbo: its fixed 8-step schedule without CFG (model card).
-    let cfg = 1.0;
+    let adv = &req.advanced;
+    let base = rec.sampling_mode == SamplingMode::Base;
+    // Base uses sd-server's normal flow-matching schedule, NOT Turbo's custom
+    // nine-sigma distilled schedule. Turbo stays byte-for-byte identical.
+    let cfg = if base { adv.cfg.unwrap_or(2.0) } else { 1.0 };
+    let mut steps = if base { adv.steps.unwrap_or(40) } else { TURBO_STEPS };
+    if base && !(1..=150).contains(&steps) {
+        return Err(AppError::invalid("Base steps must be between 1 and 150."));
+    }
+    if base && (!cfg.is_finite() || !(0.1..=20.0).contains(&cfg)) {
+        return Err(AppError::invalid("Base CFG must be between 0.1 and 20."));
+    }
     let budget_tokens = planning_token_budget(inputs.vram_total_mib, inputs.unified_memory);
     let budget_area = budget_tokens * PIXELS_PER_TOKEN;
     let tier_area = resolution_area(req.resolution, quality, rec);
-    let adv = &req.advanced;
-    let mut steps = TURBO_STEPS;
     let batch_count = if mode == ResolvedMode::Upscale { 1 } else { adv.batch_count.unwrap_or(1).clamp(1, 8) };
     let mut optimized = false;
     // Diffusion always runs in one pass; larger outputs are enlarged with the upscaler
@@ -1204,7 +1216,7 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
     };
     let negative_prompt = req.negative_prompt.clone().unwrap_or_default();
     if !negative_prompt.trim().is_empty() && !quick_upscale {
-        notes.push("The negative prompt is ignored: Turbo runs without CFG.".into());
+        notes.push(if base { "The negative prompt is ignored at CFG 1.".into() } else { "The negative prompt is ignored: Turbo runs without CFG.".into() });
     }
     Ok(Plan {
         mode,
@@ -1235,7 +1247,7 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
         upscaler: inputs.upscaler.clone(),
         upscale_tile: if inputs.upscale_tile > 0 { inputs.upscale_tile } else { LARGE_UPSCALE_TILE },
         upscale,
-        custom_sigmas: if quick_upscale { Vec::new() } else { TURBO_SIGMAS.to_vec() },
+        custom_sigmas: if quick_upscale || base { Vec::new() } else { TURBO_SIGMAS.to_vec() },
         vae_tile,
         reference_detail: matches!(mode, ResolvedMode::Edit | ResolvedMode::MultiReference | ResolvedMode::Compose | ResolvedMode::Inpaint).then(|| adv.reference_detail.unwrap_or_default()),
     })
@@ -1303,6 +1315,44 @@ mod tests {
         assert_eq!((p.steps, p.cfg, p.sampler.as_str()), (8, 1.0, "euler"), "Turbo: 8 steps, no CFG (official)");
         assert!(p.vae_tiling, "1.5K is above a 16 GB card's untiled budget");
         assert!(p.references.is_empty());
+    }
+
+    #[test]
+    fn base_sampling_values_reach_native_request() {
+        let mut base = rec();
+        base.sampling_mode = SamplingMode::Base;
+        let mut r = req("a lighthouse at dusk");
+        r.advanced.steps = Some(40);
+        r.advanced.cfg = Some(2.0);
+        let p = plan(&r, &inputs(&[]), &base).unwrap();
+        assert_eq!((p.steps, p.cfg), (40, 2.0));
+        assert!(p.custom_sigmas.is_empty(), "Base must not use Turbo's fixed sigmas");
+        let prepared = crate::pipeline::prepare(
+            &p, &r.prompt, 42, &[], None, &crate::pipeline::BackendOptions::default(),
+        ).unwrap();
+        let payload = serde_json::to_value(&prepared.request).unwrap();
+        assert_eq!(payload["sample_params"]["sample_steps"], 40);
+        assert_eq!(payload["sample_params"]["guidance"]["txt_cfg"], 2.0);
+        assert!(payload["sample_params"].get("custom_sigmas").is_none());
+
+        let defaults = plan(&req("a lighthouse at dusk"), &inputs(&[]), &base).unwrap();
+        assert_eq!((defaults.steps, defaults.cfg), (40, 2.0));
+
+        r.advanced.steps = Some(0);
+        assert!(plan(&r, &inputs(&[]), &base).is_err());
+        r.advanced.steps = Some(40);
+        r.advanced.cfg = Some(0.0);
+        assert!(plan(&r, &inputs(&[]), &base).is_err());
+    }
+
+    #[test]
+    fn turbo_ignores_base_sampling_overrides() {
+        let mut r = req("a lighthouse at dusk");
+        r.advanced.steps = Some(40);
+        r.advanced.cfg = Some(2.0);
+        let p = plan(&r, &inputs(&[]), &rec()).unwrap();
+        assert_eq!((p.steps, p.cfg), (8, 1.0));
+        assert_eq!(p.custom_sigmas, TURBO_SIGMAS.to_vec());
     }
 
     #[test]
