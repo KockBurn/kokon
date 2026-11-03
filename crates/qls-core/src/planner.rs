@@ -1215,7 +1215,7 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
         None => estimated_seconds,
     };
     let negative_prompt = req.negative_prompt.clone().unwrap_or_default();
-    if !negative_prompt.trim().is_empty() && !quick_upscale {
+    if !negative_prompt.trim().is_empty() && !quick_upscale && !uses_guidance(cfg) {
         notes.push(if base { "The negative prompt is ignored at CFG 1.".into() } else { "The negative prompt is ignored: Turbo runs without CFG.".into() });
     }
     Ok(Plan {
@@ -1327,6 +1327,10 @@ mod tests {
         let p = plan(&r, &inputs(&[]), &base).unwrap();
         assert_eq!((p.steps, p.cfg), (40, 2.0));
         assert!(p.custom_sigmas.is_empty(), "Base must not use Turbo's fixed sigmas");
+        r.negative_prompt = Some("blurry".into());
+        let guided = plan(&r, &inputs(&[]), &base).unwrap();
+        assert!(!guided.notes.iter().any(|n| n.contains("negative prompt is ignored")));
+
         let prepared = crate::pipeline::prepare(
             &p, &r.prompt, 42, &[], None, &crate::pipeline::BackendOptions::default(),
         ).unwrap();
