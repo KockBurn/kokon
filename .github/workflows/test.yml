@@ -36,3 +36,12 @@ jobs:
       - name: Test MCP paths, tools, version and help
         working-directory: mcp
         run: npm test -- test/paths.test.ts test/tools.test.ts test/version.test.ts test/help.test.ts
+
+  rust-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test Base and Turbo planners and native request serialization
+        run: cargo test -p qls-core --locked

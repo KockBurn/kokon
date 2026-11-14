@@ -134,7 +134,7 @@ const BASE_21_FILES: &[(u64, &str)] = &[
 ];
 const FINGERPRINT_BYTES: u64 = 64 << 10;
 
-const BASE_MODEL_WARNING: &str = "This looks like the base Qwen-Image 2.1 model, not Turbo. Kokon always runs 8 steps, which is made for Turbo: with the base model, images come out soft and unfinished. Download the official Turbo file, or choose a Qwen-Image 2.1 Turbo file.";
+const BASE_MODEL_WARNING: &str = "This looks like Qwen-Image 2.1 Base. In Settings → Models, set Sampling profile to Base to enable adjustable steps and CFG. Turbo's 8-step profile produces unfinished images with Base weights.";
 
 /// The first 32 hex digits of the SHA-256 of 64 KiB in the middle of the file.
 fn fingerprint(path: &Path, size: u64) -> std::io::Result<String> {
@@ -850,7 +850,7 @@ pub(crate) mod tests {
         let table = [(size, fp.as_str())];
         let b = inspect_with(&base, &table).unwrap();
         assert_eq!((b.compatible, b.problem.as_deref()), (true, None), "a warning, not a block");
-        assert!(b.warning.unwrap().contains("not Turbo"));
+        assert!(b.warning.unwrap().contains("Sampling profile to Base"));
         // Renamed, it is still the base model.
         let renamed = dir.path().join("my-turbo.gguf");
         std::fs::copy(&base, &renamed).unwrap();
