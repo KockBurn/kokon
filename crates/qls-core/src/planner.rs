@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::config::RecommendedSettings;
+use crate::config::{RecommendedSettings, SamplingMode};
 use crate::error::{AppError, ErrorCode};
 use crate::geometry::{
     self, CanvasLimits, Expansion, ExpansionUnits, OutpaintPlan, Rect, Size, WorkingCanvas, aspect_label, dims_for_area,
@@ -197,6 +197,10 @@ pub struct OutpaintSpec {
 #[serde(default)]
 pub struct AdvancedOptions {
     pub sampler: Option<String>,
+    /// Base-model steps (Turbo intentionally ignores this setting).
+    pub steps: Option<u32>,
+    /// Base-model text CFG (Turbo intentionally ignores this setting).
+    pub cfg: Option<f32>,
     /// Edit/inpaint denoising strength (0..1).
     pub strength: Option<f32>,
     pub batch_count: Option<u32>,
@@ -285,6 +289,14 @@ pub struct GenerationRequest {
     /// `JobView::enhanced_prompt` and no image, so the user can read and change it first.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enhance_only: bool,
+    /// Prompt+ "Detailed": a longer prompt with more context about what is in the image or what
+    /// changes (enhancer::detailed). Standard lengths otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enhance_detail: bool,
+    /// Layers lab "Blend into scene": only read the place the object with this name stands in
+    /// (`scene`, the Prompt+ model). The job ends with the reading in `JobView::scene` and no image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_scene: Option<String>,
     /// The user's own words when `prompt` was written by Prompt+ in a review (and maybe changed
     /// by the user since): kept as the record's original prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,6 +305,23 @@ pub struct GenerationRequest {
     /// no LoRA (MCP and the HTTP API don't use LoRAs for now). Not used by upscales.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loras: Option<Vec<String>>,
+    /// Inpaint only: coloured marks drawn by the user, an image source the mask's size (transparent
+    /// where nothing is drawn). The model's only reference is the region with the marks drawn on,
+    /// and the prompt names what goes at each colour; no guide image (see pipeline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marks: Option<String>,
+    /// The result is left out of the gallery list (a layers lab step, see `GenerationRecord::hidden`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    /// More like this: a new version of image 1 (the only image) that keeps its layout, look and
+    /// size, drawn again with this share of the steps (0.5 = the last 4 of 8: close; 0.75: freer).
+    /// Text to image started from the image (img2img), not an edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vary: Option<f32>,
+    /// The title of the app's project the result joins: its folder when `AppConfig::project_folders`
+    /// is on (sent by the app only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -323,9 +352,9 @@ pub struct Plan {
     pub working: Size,
     /// Content area inside `working` that maps to the output (rest is alignment padding).
     pub content: Rect,
-    /// Sampling steps (Turbo's 8; 0 = no diffusion, a Quick upscale).
+    /// Sampling steps (Turbo uses 8, Base defaults to 40; 0 for Quick upscale).
     pub steps: u32,
-    /// Always 1 (Turbo runs without classifier-free guidance).
+    /// Effective text CFG (Turbo uses 1, Base defaults to 2).
     pub cfg: f32,
     pub sampler: String,
     pub strength: Option<f32>,
@@ -337,6 +366,9 @@ pub struct Plan {
     pub outpaint: Option<OutpaintPlan>,
     /// Region of the source sent to the model for inpainting.
     pub inpaint_region: Option<Rect>,
+    /// Inpaint with coloured marks (`GenerationRequest::marks`): one reference, no guide.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub marks: bool,
     /// Resolved inpaint action (see [`InpaintAction::resolve`]).
     #[serde(default)]
     pub inpaint_action: Option<InpaintAction>,
@@ -834,6 +866,10 @@ fn detect_mode(req: &GenerationRequest, inputs: &PlanInputs) -> Result<(Resolved
     let has_outpaint = req.outpaint.map(|o| o.left > 0.0 || o.right > 0.0 || o.top > 0.0 || o.bottom > 0.0).unwrap_or(false);
     let need = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(AppError::invalid(msg)) };
     let explicit = |m: ResolvedMode, why: &str| Ok((m, false, why.to_string()));
+    if req.vary.is_some() {
+        need(n == 1, "More like this starts from one image.")?;
+        return explicit(ResolvedMode::Generate, "More like this");
+    }
     match req.mode {
         Mode::Generate => explicit(ResolvedMode::Generate, "Selected"),
         Mode::Edit => {
@@ -904,24 +940,38 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
         return Err(AppError::invalid(format!("Use at most {} reference images.", rec.max_references)));
     }
     let (mode, auto_mode, mode_reason) = detect_mode(req, inputs)?;
-    if req.enhance_only && !(req.enhance && crate::enhancer::applies(mode)) {
-        return Err(AppError::invalid("Prompt+ writes prompts for new images, edits and combines only."));
+    let marks = mode == ResolvedMode::Inpaint && req.marks.is_some();
+    if req.enhance_only && !(req.enhance && crate::enhancer::applies_to(mode, marks)) {
+        return Err(AppError::invalid("Prompt+ does not write prompts for upscales."));
     }
-    let inpaint_action = (mode == ResolvedMode::Inpaint).then(|| req.inpaint_action.resolve(&req.prompt));
-    // Upscales and removals need no description.
-    let prompt_optional = mode == ResolvedMode::Upscale || inpaint_action == Some(InpaintAction::Remove);
+    // Marks: the prompt names things by colour, never an action of its own (a Remove would blur the marks away).
+    let inpaint_action = (mode == ResolvedMode::Inpaint).then(|| if marks { InpaintAction::Edit } else { req.inpaint_action.resolve(&req.prompt) });
+    if req.read_scene.is_some() && (mode != ResolvedMode::Edit || inputs.image_sizes.len() != 1) {
+        return Err(AppError::invalid("The scene is read from one image, as an edit."));
+    }
+    // Upscales and removals need no description, nor a scene reading (the object's name is its own
+    // field), nor an expansion (it continues the scene; Prompt+ can write what the new areas show).
+    let prompt_optional = mode == ResolvedMode::Upscale || mode == ResolvedMode::Outpaint || inpaint_action == Some(InpaintAction::Remove) || req.read_scene.is_some();
     if req.prompt.trim().is_empty() && !prompt_optional {
         return Err(AppError::invalid("Describe what to generate or change."));
     }
     let mut notes = Vec::new();
     let quality = req.quality;
-    // Turbo: its fixed 8-step schedule without CFG (model card).
-    let cfg = 1.0;
+    let adv = &req.advanced;
+    let base = rec.sampling_mode == SamplingMode::Base;
+    // Base uses sd-server's normal flow-matching schedule, NOT Turbo's custom
+    // nine-sigma distilled schedule. Turbo stays byte-for-byte identical.
+    let cfg = if base { adv.cfg.unwrap_or(2.0) } else { 1.0 };
+    let mut steps = if base { adv.steps.unwrap_or(40) } else { TURBO_STEPS };
+    if base && !(1..=150).contains(&steps) {
+        return Err(AppError::invalid("Base steps must be between 1 and 150."));
+    }
+    if base && (!cfg.is_finite() || !(0.1..=20.0).contains(&cfg)) {
+        return Err(AppError::invalid("Base CFG must be between 0.1 and 20."));
+    }
     let budget_tokens = planning_token_budget(inputs.vram_total_mib, inputs.unified_memory);
     let budget_area = budget_tokens * PIXELS_PER_TOKEN;
     let tier_area = resolution_area(req.resolution, quality, rec);
-    let adv = &req.advanced;
-    let mut steps = TURBO_STEPS;
     let batch_count = if mode == ResolvedMode::Upscale { 1 } else { adv.batch_count.unwrap_or(1).clamp(1, 8) };
     let mut optimized = false;
     // Diffusion always runs in one pass; larger outputs are enlarged with the upscaler
@@ -991,7 +1041,18 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
                     },
                 },
             };
-            if let Some((w, h)) = explicit_dims {
+            if let Some(v) = req.vary {
+                // The image's own size and shape, rendered at the preset's size as an edit is.
+                let src = inputs.image_sizes[0];
+                let wanted = match req.resolution {
+                    ResolutionMode::Auto => tier_area.unwrap_or(rec.area_balanced).min(src.area().max(256 * 256)),
+                    _ => tier_area.unwrap_or(src.area()),
+                };
+                let area = cap(wanted, &mut notes);
+                working = plan_working_canvas(src, &CanvasLimits { min_side: 64, ..limits(area, rec) });
+                output = src;
+                strength = Some(if v.is_finite() { v.clamp(0.1, 1.0) } else { 0.5 });
+            } else if let Some((w, h)) = explicit_dims {
                 if !(64..=rec.max_side).contains(&w) || !(64..=rec.max_side).contains(&h) {
                     return Err(AppError::invalid(format!("Width and height must be between 64 and {}.", rec.max_side)));
                 }
@@ -1091,10 +1152,11 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
             );
             // References: the region itself (at most the reference cap, as in edits), plus a
             // smaller copy with the area marked. Full: both at the output's area (the server's
-            // own resize), as before 0.9.4.
+            // own resize), as before 0.9.4. Coloured marks show the area themselves: no guide.
+            let guide_share = if marks { 0.0 } else { INPAINT_GUIDE_AREA };
             let wanted = tier_area.unwrap_or(src.area());
             let image1_share = if wanted > ref_cap.saturating_add(ref_cap / 10) { ref_cap as f64 / wanted as f64 } else { 1.0 };
-            let area = cap_for_refs(wanted, image1_share + INPAINT_GUIDE_AREA, &mut notes);
+            let area = cap_for_refs(wanted, image1_share + guide_share, &mut notes);
             // At least the working size of context around the mask, so the model sees the scene.
             let min_ctx = (area as f64).sqrt() as u32;
             let region = geometry::inpaint_region(src, bbox, min_ctx, 0.55);
@@ -1109,8 +1171,10 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
             // The image being painted stays at the working size; only the model's view of it shrinks.
             let image1 = if working.canvas.area() <= ref_cap.saturating_add(ref_cap / 10) { working } else { ref_canvas(region.size(), ref_cap, rec) };
             references.push(RefPlan { index: 0, source: region.size(), canvas: image1 });
-            let guide_area = (working.canvas.area() as f64 * INPAINT_GUIDE_AREA) as u64;
-            references.push(RefPlan { index: 0, source: region.size(), canvas: ref_canvas(region.size(), guide_area, rec) });
+            if !marks {
+                let guide_area = (working.canvas.area() as f64 * INPAINT_GUIDE_AREA) as u64;
+                references.push(RefPlan { index: 0, source: region.size(), canvas: ref_canvas(region.size(), guide_area, rec) });
+            }
             strength = Some(adv.strength.unwrap_or(1.0).clamp(0.05, 1.0));
         }
         ResolvedMode::Outpaint => {
@@ -1127,7 +1191,9 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
                 _ => tier_area.unwrap().min(final_area.max(256 * 256)),
             };
             let area = cap_for_refs(wanted, 1.0, &mut notes);
-            let p = plan_outpaint(src, exp, &limits(area, rec), 32).map_err(AppError::invalid)?;
+            // 64 working px of the original's border are regenerated and blended: narrower bands
+            // left a visible line on flat backgrounds (10-30 suit Expand).
+            let p = plan_outpaint(src, exp, &limits(area, rec), 64).map_err(AppError::invalid)?;
             working = p.working;
             output = p.final_size;
             references.push(RefPlan { index: 0, source: src, canvas: ref_canvas(src, p.working.canvas.area(), rec) });
@@ -1203,8 +1269,8 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
         None => estimated_seconds,
     };
     let negative_prompt = req.negative_prompt.clone().unwrap_or_default();
-    if !negative_prompt.trim().is_empty() && !quick_upscale {
-        notes.push("The negative prompt is ignored: Turbo runs without CFG.".into());
+    if !negative_prompt.trim().is_empty() && !quick_upscale && !uses_guidance(cfg) {
+        notes.push(if base { "The negative prompt is ignored at CFG 1.".into() } else { "The negative prompt is ignored: Turbo runs without CFG.".into() });
     }
     Ok(Plan {
         mode,
@@ -1225,6 +1291,7 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
         references,
         outpaint,
         inpaint_region,
+        marks,
         inpaint_action,
         quality,
         resolution: req.resolution,
@@ -1235,7 +1302,7 @@ pub fn plan(req: &GenerationRequest, inputs: &PlanInputs, rec: &RecommendedSetti
         upscaler: inputs.upscaler.clone(),
         upscale_tile: if inputs.upscale_tile > 0 { inputs.upscale_tile } else { LARGE_UPSCALE_TILE },
         upscale,
-        custom_sigmas: if quick_upscale { Vec::new() } else { TURBO_SIGMAS.to_vec() },
+        custom_sigmas: if quick_upscale || base { Vec::new() } else { TURBO_SIGMAS.to_vec() },
         vae_tile,
         reference_detail: matches!(mode, ResolvedMode::Edit | ResolvedMode::MultiReference | ResolvedMode::Compose | ResolvedMode::Inpaint).then(|| adv.reference_detail.unwrap_or_default()),
     })
@@ -1303,6 +1370,48 @@ mod tests {
         assert_eq!((p.steps, p.cfg, p.sampler.as_str()), (8, 1.0, "euler"), "Turbo: 8 steps, no CFG (official)");
         assert!(p.vae_tiling, "1.5K is above a 16 GB card's untiled budget");
         assert!(p.references.is_empty());
+    }
+
+    #[test]
+    fn base_sampling_values_reach_native_request() {
+        let mut base = rec();
+        base.sampling_mode = SamplingMode::Base;
+        let mut r = req("a lighthouse at dusk");
+        r.advanced.steps = Some(40);
+        r.advanced.cfg = Some(2.0);
+        let p = plan(&r, &inputs(&[]), &base).unwrap();
+        assert_eq!((p.steps, p.cfg), (40, 2.0));
+        assert!(p.custom_sigmas.is_empty(), "Base must not use Turbo's fixed sigmas");
+        r.negative_prompt = Some("blurry".into());
+        let guided = plan(&r, &inputs(&[]), &base).unwrap();
+        assert!(!guided.notes.iter().any(|n| n.contains("negative prompt is ignored")));
+
+        let prepared = crate::pipeline::prepare(
+            &p, &r.prompt, 42, &[], None, &crate::pipeline::BackendOptions::default(),
+        ).unwrap();
+        let payload = serde_json::to_value(&prepared.request).unwrap();
+        assert_eq!(payload["sample_params"]["sample_steps"], 40);
+        assert_eq!(payload["sample_params"]["guidance"]["txt_cfg"], 2.0);
+        assert!(payload["sample_params"].get("custom_sigmas").is_none());
+
+        let defaults = plan(&req("a lighthouse at dusk"), &inputs(&[]), &base).unwrap();
+        assert_eq!((defaults.steps, defaults.cfg), (40, 2.0));
+
+        r.advanced.steps = Some(0);
+        assert!(plan(&r, &inputs(&[]), &base).is_err());
+        r.advanced.steps = Some(40);
+        r.advanced.cfg = Some(0.0);
+        assert!(plan(&r, &inputs(&[]), &base).is_err());
+    }
+
+    #[test]
+    fn turbo_ignores_base_sampling_overrides() {
+        let mut r = req("a lighthouse at dusk");
+        r.advanced.steps = Some(40);
+        r.advanced.cfg = Some(2.0);
+        let p = plan(&r, &inputs(&[]), &rec()).unwrap();
+        assert_eq!((p.steps, p.cfg), (8, 1.0));
+        assert_eq!(p.custom_sigmas, TURBO_SIGMAS.to_vec());
     }
 
     #[test]
@@ -1804,7 +1913,16 @@ mod tests {
         assert!(plan(&r, &inputs(&[(800, 800)]), &rec()).is_err(), "expansions wrap the prompt themselves");
         // The fields stay out of saved requests unless used.
         let v = serde_json::to_value(req("x")).unwrap();
-        assert!(v.get("enhance_only").is_none() && v.get("enhanced_from").is_none());
+        assert!(v.get("enhance_only").is_none() && v.get("enhanced_from").is_none() && v.get("read_scene").is_none());
+    }
+
+    #[test]
+    fn scene_reading_is_an_edit_of_one_image() {
+        let mut r = req("");
+        r.read_scene = Some("woman".into());
+        assert_eq!(plan(&r, &inputs(&[(1324, 1176)]), &rec()).unwrap().mode, ResolvedMode::Edit, "no prompt needed");
+        assert!(plan(&r, &inputs(&[]), &rec()).is_err(), "no image");
+        assert!(plan(&r, &inputs(&[(800, 800), (800, 800)]), &rec()).is_err(), "two images");
     }
 
     #[test]

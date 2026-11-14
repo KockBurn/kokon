@@ -24,7 +24,7 @@ pub const DEFAULT_REMOTE_PORT: u16 = 39152;
 /// Schema 9 (2026-10-16, #14): profiles record their model and source; model paths edited by
 /// hand on the official profile move to a profile of the user's own files.
 /// Schema 10 (2026-10-19): the 8 GB preset's VRAM reserve 1 -> 1.5 GiB (unless set by hand).
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 /// `upscaler_model` value for a plain Lanczos resize (no model).
 pub const LANCZOS: &str = "lanczos";
 /// Upscalers offered in Settings: (file stem, label). Superscale-SP is a setup download, MoSR is
@@ -138,12 +138,23 @@ pub enum RefineMode {
     Best,
 }
 
-/// Per-model planning settings. Sampling itself is fixed by the Turbo model: its 8-step
-/// schedule (`planner::TURBO_SIGMAS`) at CFG 1.
+/// Explicit sampling profile for user-supplied Qwen Image 2.1 weights.
+/// Never infer this from filenames: Base and Turbo share tensor structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingMode {
+    #[default]
+    Turbo,
+    Base,
+}
+
+/// Per-model planning settings. Official Kokon weights always use Turbo's
+/// exact eight-step schedule; custom files may opt into Base sampling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecommendedSettings {
     pub sampler: String,
+    pub sampling_mode: SamplingMode,
     /// Pixel area used by Auto resolution at each quality level.
     pub area_fast: u64,
     pub area_balanced: u64,
@@ -158,7 +169,7 @@ impl Default for RecommendedSettings {
         // Official Qwen-Image 2.1 Turbo settings (Qwen/Qwen-Image-2.1-Turbo model card): its
         // saved 8-step schedule with flow-matching Euler, no CFG, native 2K buckets. The
         // presets differ only in size: ~1 MP, 1.5K and native 2K.
-        Self { sampler: "euler".into(), area_fast: 1024 * 1024, area_balanced: 1536 * 1536, area_quality: 2048 * 2048, align: 32, max_side: 4096, max_references: 10 }
+        Self { sampler: "euler".into(), sampling_mode: SamplingMode::Turbo, area_fast: 1024 * 1024, area_balanced: 1536 * 1536, area_quality: 2048 * 2048, align: 32, max_side: 4096, max_references: 10 }
     }
 }
 
@@ -338,15 +349,19 @@ pub struct AppConfig {
     pub upscale_prescale: bool,
     pub extra_server_args: Vec<String>,
     /// Kokon's own engine for Apple Silicon (`engine-mac/`, `kokon-engine-mac serve`) instead of sd.cpp's Metal build:
-    /// the GPU, the CPU's matrix unit and the Neural Engine together, ~4x faster text to image on an M2 Pro. Experimental
-    /// and off by default (Settings → Performance). Text to image, edits with references, brushed edits, extending an
-    /// image and Prompt+; no LoRAs or second passes yet (`Capabilities::mac_engine_unsupported`). sd.cpp stays the default,
-    /// the fallback, and the engine on Windows and Linux.
+    /// the GPU, the CPU's matrix unit and the Neural Engine together, ~4x faster text to image on an M2 Pro. Experimental;
+    /// false in a new config, but the default on Macs with 16 GB+ since 0.12: the desktop app switches it on once at
+    /// start (`macEngineDefaultDue` in src/lib/logic.ts) unless the user already chose (Settings → Performance). Text to image, edits with references, brushed edits, extending an
+    /// image and Prompt+; no LoRAs or second passes yet (`Capabilities::mac_engine_unsupported`). sd.cpp stays the fallback,
+    /// the engine on Windows and Linux and on smaller Macs.
     pub mac_engine: bool,
     pub output_dir: PathBuf,
+    /// Results of a project the app sends go to `<output_dir>/<project title>/`, named with the
+    /// date and time, instead of one folder per day. Off by default (Settings → General).
+    pub project_folders: bool,
     pub keep_server_running: bool,
-    /// When no desktop window is attached (e.g. MCP only), unload the model after this
-    /// many idle minutes. 0 disables.
+    /// Unload the model after this many minutes without work, also while a window or browser tab is
+    /// open, so the GPU is free for other programs; the next job loads it again. 0 disables.
     pub idle_unload_minutes: u32,
     pub setup_complete: bool,
     /// Hardware preset chosen in the setup wizard (`catalog::PRESETS`).
@@ -396,8 +411,9 @@ impl Default for AppConfig {
             extra_server_args: vec![],
             mac_engine: false,
             output_dir: default_output_dir(),
+            project_folders: false,
             keep_server_running: false,
-            idle_unload_minutes: 15,
+            idle_unload_minutes: 10,
             setup_complete: false,
             hardware_preset: crate::catalog::DEFAULT_PRESET.into(),
             vram_override_mib: 0,
@@ -578,6 +594,11 @@ impl AppConfig {
                     }
                     if c.schema_version < 10 && c.hardware_preset == "8gb" && c.vram_reserve_gib == 1.0 {
                         c.vram_reserve_gib = c.preset().vram_reserve_gib;
+                    }
+                    // Idle unload now also applies with a window open: the old default (15) moves
+                    // to the new one; a value set by hand stays.
+                    if c.schema_version < 11 && c.idle_unload_minutes == 15 {
+                        c.idle_unload_minutes = 10;
                     }
                     // The official weights are always available as a profile, built for the
                     // configured folder and preset; the active one stays as it is.
@@ -1241,6 +1262,21 @@ mod tests {
         // A tile size chosen after the change is kept.
         std::fs::write(&p, r#"{"schemaVersion":8,"upscaleTileSize":512}"#).unwrap();
         assert_eq!(AppConfig::load_from(&p).upscale_tile_size, 512);
+    }
+
+    #[test]
+    fn idle_unload_default_moves_to_10() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"schemaVersion":10,"idleUnloadMinutes":15}"#).unwrap();
+        assert_eq!(AppConfig::load_from(&p).idle_unload_minutes, 10, "the old default moves");
+        std::fs::write(&p, r#"{"schemaVersion":10,"idleUnloadMinutes":45}"#).unwrap();
+        assert_eq!(AppConfig::load_from(&p).idle_unload_minutes, 45, "a value set by hand stays");
+        std::fs::write(&p, r#"{"schemaVersion":10,"idleUnloadMinutes":0}"#).unwrap();
+        assert_eq!(AppConfig::load_from(&p).idle_unload_minutes, 0, "turned off stays off");
+        std::fs::write(&p, r#"{"schemaVersion":11,"idleUnloadMinutes":15}"#).unwrap();
+        assert_eq!(AppConfig::load_from(&p).idle_unload_minutes, 15, "15 chosen after the change stays");
+        assert_eq!(AppConfig::default().idle_unload_minutes, 10);
     }
 
     #[test]
