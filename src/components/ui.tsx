@@ -85,7 +85,10 @@ export function Popover(props: {
                 {props.children(() => setOpen(false))}
               </div>
             </>,
-            document.body,
+            // Kokon's phone shell follows the visual viewport while iOS opens the keyboard.
+            // Keep its bottom sheets in that same coordinate space, not the page body.
+            // Other narrow views without a phone shell keep the original behavior.
+            ref.current?.closest(".phone-app") ?? document.body,
           )
         ) : (
           <div className={`popover ${props.className ?? ""}`} style={{ ...pos[placement], maxHeight, overflowY: "auto" }}>
