@@ -871,12 +871,14 @@ mod openai_bridge_tests {
             "prompt": "A fox in the snow",
             "size": "1024x1024",
             "response_format": "b64_json",
+            "seed": 424242,
             "n": 1
         })).unwrap();
         let op = req.into_kokon_operation().unwrap();
         assert_eq!(op.prompt, "A fox in the snow");
         assert_eq!((op.width, op.height), (Some(1024), Some(1024)));
         assert_eq!(op.client.as_deref(), Some("openwebui"));
+        assert_eq!(op.seed, Some(424242));
         // No quality/sampler/steps/CFG override: the active Kokon profile
         // supplies Turbo 8/1 + sigmas or Base 40/2 + automatic flow.
         assert_eq!(op.quality, None);
@@ -890,6 +892,8 @@ struct OpenAIImageRequest {
     prompt: String,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    seed: Option<i64>,
     #[serde(default)]
     size: Option<String>,
     #[serde(default)]
@@ -926,6 +930,7 @@ impl OpenAIImageRequest {
             prompt: self.prompt,
             width,
             height,
+            seed: self.seed,
             client: Some("openwebui".into()),
             ..Default::default()
         })
