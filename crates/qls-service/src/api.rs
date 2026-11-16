@@ -860,6 +860,29 @@ async fn wait_job(State(s): St, AxPath(id): AxPath<String>, Query(q): Query<Wait
     Ok(Json(wait_for(&s, &id, Duration::from_secs(q.timeout.unwrap_or(60).min(600))).await?))
 }
 
+#[cfg(test)]
+mod openai_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn openwebui_request_uses_native_model_profile_not_fixed_sampling() {
+        let req: OpenAIImageRequest = serde_json::from_value(json!({
+            "model": "sd-cpp-local",
+            "prompt": "A fox in the snow",
+            "size": "1024x1024",
+            "response_format": "b64_json",
+            "n": 1
+        })).unwrap();
+        let op = req.into_kokon_operation().unwrap();
+        assert_eq!(op.prompt, "A fox in the snow");
+        assert_eq!((op.width, op.height), (Some(1024), Some(1024)));
+        assert_eq!(op.client.as_deref(), Some("openwebui"));
+        // No quality/sampler/steps/CFG override: the active Kokon profile
+        // supplies Turbo 8/1 + sigmas or Base 40/2 + automatic flow.
+        assert_eq!(op.quality, None);
+    }
+}
+
 // Minimal OpenAI image API adapter for Open WebUI. It only translates the wire
 // format: image generation runs through Kokon's existing native job/planner.
 #[derive(Deserialize)]
@@ -926,7 +949,7 @@ async fn openai_image_generations(State(s): St, Json(form): Json<OpenAIImageRequ
     let bytes = tokio::fs::read(path).await
         .map_err(|e| AppError::io("read the generated image", path, e))?;
 
-    // The generation record contains measured output, not guessed settings.
+    // The generation record contains Kokon's resolved settings used for the request.
     // OpenAI consumers ignore the extra 'kokon' field until a UI reads it.
     let details = json!({
         "model": record.model,
