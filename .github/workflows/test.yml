@@ -45,3 +45,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test Base and Turbo planners and native request serialization
         run: cargo test -p qls-core --locked
+      - name: Test Kokon headless API and Open WebUI adapter
+        run: cargo test -p qls-service --locked

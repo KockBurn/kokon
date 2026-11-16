@@ -134,6 +134,35 @@ async fn nothing_without_credentials() {
     }
 }
 
+
+#[tokio::test]
+async fn openwebui_native_images_require_local_auth_and_validate_before_generation() {
+    let f = fixture(true);
+    let local = app(&f, false, "127.0.0.1");
+    let remote = app(&f, true, "192.168.1.50");
+    let endpoint = "/v1/images/generations";
+    let valid_shape = json!({
+        "model": "sd-cpp-local", "prompt": "A cat",
+        "size": "1024x1024", "n": 2, "response_format": "b64_json"
+    });
+    // Unauthenticated clients cannot reach the GPU.
+    let no_auth = send(&local, "POST", endpoint, &[], Some(valid_shape.clone())).await;
+    assert_eq!(no_auth.status, StatusCode::UNAUTHORIZED);
+    let wrong = send(&local, "POST", endpoint, &[("authorization", "Bearer wrong")], Some(valid_shape.clone())).await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    let auth = format!("Bearer {}", f.state.token);
+    // Invalid batch sizes fail before trying to start an inference server.
+    let bad_n = send(&local, "POST", endpoint, &[("authorization", &auth)], Some(valid_shape)).await;
+    assert_eq!((bad_n.status, bad_n.code()), (StatusCode::BAD_REQUEST, "invalid_input"));
+    let malformed_size = send(&local, "POST", endpoint, &[("authorization", &auth)],
+        Some(json!({ "model": "sd-cpp-local", "prompt": "A cat", "size": "1024xBAD", "n": 1 }))).await;
+    assert_eq!((malformed_size.status, malformed_size.code()), (StatusCode::BAD_REQUEST, "invalid_input"));
+    // The service's remote listener must not honor the local API token.
+    let lan = send(&remote, "POST", endpoint, &[("authorization", &auth)],
+        Some(json!({ "prompt": "A cat", "size": "1024x1024", "n": 1 }))).await;
+    assert_eq!(lan.status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn the_token_works_on_loopback_only() {
     let f = fixture(true);
