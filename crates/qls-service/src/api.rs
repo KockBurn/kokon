@@ -140,6 +140,12 @@ pub fn router(state: Arc<AppState>, lan: bool) -> Router {
         .route("/remote/password", post(remote_password).delete(remote_password_clear))
         .layer(middleware::from_fn_with_state(ctx.clone(), auth))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
+    // OpenAI image requests enter Kokon's own native generation planner, not
+    // the raw sd-server endpoint. This reuses model-aware Base/Turbo settings.
+    let openai_images = Router::new()
+        .route("/images/generations", post(openai_image_generations))
+        .layer(middleware::from_fn_with_state(ctx.clone(), auth))
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
     let uploads = Router::new()
         .route("/inputs", post(upload_input))
         .route("/provenance/check", post(check_provenance))
@@ -150,6 +156,7 @@ pub fn router(state: Arc<AppState>, lan: bool) -> Router {
         .route("/api/v1/auth/login", post(web::login))
         .route("/api/v1/auth/logout", post(web::logout))
         .nest("/api/v1", api.merge(uploads.layer(middleware::from_fn_with_state(ctx, auth))))
+        .nest("/v1", openai_images)
         .fallback(web::ui)
         .layer(middleware::from_fn(cors))
         .with_state(state)
@@ -851,6 +858,98 @@ async fn wait_for(s: &AppState, id: &str, timeout: Duration) -> Result<JobView, 
 /// Long-poll until the job finishes or `timeout` seconds pass (default 60, max 600).
 async fn wait_job(State(s): St, AxPath(id): AxPath<String>, Query(q): Query<WaitQ>) -> ApiResult<Json<JobView>> {
     Ok(Json(wait_for(&s, &id, Duration::from_secs(q.timeout.unwrap_or(60).min(600))).await?))
+}
+
+// Minimal OpenAI image API adapter for Open WebUI. It only translates the wire
+// format: image generation runs through Kokon's existing native job/planner.
+#[derive(Deserialize)]
+struct OpenAIImageRequest {
+    prompt: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    n: Option<u32>,
+    #[serde(default)]
+    response_format: Option<String>,
+}
+
+impl OpenAIImageRequest {
+    fn into_kokon_operation(self) -> Result<SimpleOp, AppError> {
+        if self.prompt.trim().is_empty() {
+            return Err(AppError::invalid("An image prompt is required."));
+        }
+        if self.n.unwrap_or(1) != 1 {
+            return Err(AppError::invalid("Kokon supports one image per OpenAI request (n=1)."));
+        }
+        if !matches!(self.response_format.as_deref(), None | Some("b64_json")) {
+            return Err(AppError::invalid("Use response_format=b64_json for Kokon images."));
+        }
+        let (width, height) = if let Some(size) = self.size {
+            let (w, h) = size.split_once('x')
+                .ok_or_else(|| AppError::invalid("Image size must be WIDTHxHEIGHT."))?;
+            match (w.parse::<u32>(), h.parse::<u32>()) {
+                (Ok(w), Ok(h)) if w > 0 && h > 0 => (Some(w), Some(h)),
+                _ => return Err(AppError::invalid("Image size must contain positive integer dimensions.")),
+            }
+        } else {
+            (None, None)
+        };
+        // Open WebUI's 'sd-cpp-local' is a provider alias, not a model selector.
+        // The currently active Kokon profile chooses Base or Turbo.
+        let _ = self.model;
+        Ok(SimpleOp {
+            prompt: self.prompt,
+            width,
+            height,
+            client: Some("openwebui".into()),
+            ..Default::default()
+        })
+    }
+}
+
+async fn openai_image_generations(State(s): St, Json(form): Json<OpenAIImageRequest>) -> ApiResult<Json<Value>> {
+    let operation = form.into_kokon_operation()?;
+    let Json(job) = run_simple(s, Mode::Generate, operation, true).await?;
+    if job.status != qls_core::engine::JobStatus::Done {
+        return Err(job.error.unwrap_or_else(|| AppError::new(
+            ErrorCode::GenerationFailed,
+            "Kokon did not complete the image generation.",
+        )).into());
+    }
+    let record = job.results.first().ok_or_else(|| AppError::new(
+        ErrorCode::GenerationFailed,
+        "Kokon finished without returning an image.",
+    ))?;
+    let path = Path::new(&record.file_path);
+    let bytes = tokio::fs::read(path).await
+        .map_err(|e| AppError::io("read the generated image", path, e))?;
+
+    // The generation record contains measured output, not guessed settings.
+    // OpenAI consumers ignore the extra 'kokon' field until a UI reads it.
+    let details = json!({
+        "model": record.model,
+        "sampler": record.sampler,
+        "scheduler": record.scheduler,
+        "steps": record.steps,
+        "cfg": record.cfg,
+        "seed": record.seed,
+        "width": record.width,
+        "height": record.height,
+        "generation_id": record.id,
+    });
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(Json(json!({
+        "created": created,
+        "data": [{
+            "b64_json": qls_core::sdcpp::b64(&bytes),
+            "kokon": details,
+        }],
+    })))
 }
 
 /// Stable convenience endpoints. Body is a simplified request; `?wait=false` returns the
