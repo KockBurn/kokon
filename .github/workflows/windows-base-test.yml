@@ -1,10 +1,11 @@
-name: Windows Base Steps-CFG test installer
+name: Windows Kokon test installer
 
 on:
   workflow_dispatch:
   push:
     branches:
       - work/kokon-upstream-0.12.1-20261114
+      - work/openwebui-native-image-20261116
     paths:
       - .github/workflows/windows-base-test.yml
 
@@ -54,12 +55,10 @@ jobs:
         run: npm run build:exe
       - name: Build unsigned Windows NSIS test installer
         run: npx tauri build --bundles nsis --no-sign --config src-tauri/tauri.base-test.conf.json
-      - name: Upload Kokon Base test installer and instructions
+      - name: Upload Kokon Windows test installer
         uses: actions/upload-artifact@v4
         with:
-          name: Kokon-Base-Steps-CFG-Windows-${{ github.run_number }}
-          path: |
-            target/release/bundle/nsis/*-setup.exe
-            docs/base-sampling-test.md
+          name: Kokon-Windows-Test-${{ github.run_number }}
+          path: target/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
           retention-days: 7
