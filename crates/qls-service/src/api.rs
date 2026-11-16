@@ -955,9 +955,13 @@ async fn openai_image_generations(State(s): St, Json(form): Json<OpenAIImageRequ
         .map_err(|e| AppError::io("read the generated image", path, e))?;
 
     // The generation record contains Kokon's resolved settings used for the request.
+    // Turbo's exact sigma list comes from the job plan, not a model-name guess.
     // OpenAI consumers ignore the extra 'kokon' field until a UI reads it.
+    let sigmas = job.plan.as_ref().map(|p| p.custom_sigmas.as_slice()).unwrap_or(&[]);
     let details = json!({
         "model": record.model,
+        "sigma_schedule": if sigmas.is_empty() { "backend_automatic" } else { "custom" },
+        "custom_sigmas": sigmas,
         "sampler": record.sampler,
         "scheduler": record.scheduler,
         "steps": record.steps,
